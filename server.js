@@ -5,6 +5,7 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const { pca } = require("./auth/msalClient");
+const healthRouter = require("./msalClient"); // 如果你用的是 routes/health.js，就改成 require("./routes/health")
 
 // CORS
 app.use(cors({ origin: true, credentials: true }));
@@ -12,7 +13,7 @@ app.use(cors({ origin: true, credentials: true }));
 // Body parser
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
+app.use(healthRouter);
 // Session (Render supports this)
 app.use(
   session({
