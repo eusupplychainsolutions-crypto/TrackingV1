@@ -4,7 +4,7 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const { pca } = require("./auth/msalClient");
+// const { pca } = require("./auth/msalClient");
 const healthRouter = require("./msalClient"); // 如果你用的是 routes/health.js，就改成 require("./routes/health")
 
 // CORS
