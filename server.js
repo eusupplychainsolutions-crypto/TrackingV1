@@ -1,10 +1,14 @@
-// server.js
+// server.js (CommonJS)
 const express = require("express");
+const cors = require("cors");
 const axios = require("axios");
 const { getGraphToken } = require("./msalClient");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json());
 
 /**
  * 基础健康检查
@@ -14,32 +18,70 @@ app.get("/", (req, res) => {
 });
 
 /**
- * Graph 探针接口（核心）
- * 目标：能不能通过 Graph 拿到 Excel workbook 信息
+ * Graph 探针：验证 token + Microsoft Graph 是否可访问
+ * 成功返回当前登录用户信息（不会泄露 token）
  */
 app.get("/api/_health/graph", async (req, res) => {
   try {
-    const token = await getGraphToken();
+    const token = await getGraphToken(["User.Read"]);
 
-    //  这里用最“轻”的 Graph 调用，不读表，只确认 workbook 存在
-    const graphRes = await axios.get(
-      `https://graph.microsoft.com/v1.0/me/drive/root:/JobTrackingSample.xlsx:/workbook`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      }
-    );
+    const r = await axios.get("https://graph.microsoft.com/v1.0/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
 
     res.json({
       ok: true,
       graph: "reachable",
-      workbook: graphRes.data.name,
+      user: r.data.userPrincipalName || r.data.mail || r.data.id,
     });
-  } catch (err) {
+  } catch (e) {
     res.status(500).json({
       ok: false,
-      error: err.message,
+      error: e.message,
+    });
+  }
+});
+
+/**
+ * Excel 探针：验证能否访问某个 OneDrive Excel Workbook
+ * 你可以用 FILE_NAME 或 ITEM_ID 二选一：
+ * - 推荐：EXCEL_FILE_NAME=JobTrackingSample.xlsx
+ * - 或：EXCEL_ITEM_ID=xxxxx!sxxxx
+ */
+app.get("/api/_health/excel", async (req, res) => {
+  try {
+    const token = await getGraphToken(["User.Read", "Files.Read"]);
+
+    const itemId = process.env.EXCEL_ITEM_ID; // 可选
+    const fileName = process.env.EXCEL_FILE_NAME || "JobTrackingSample.xlsx"; // 可选
+
+    let url;
+
+    if (itemId) {
+      // 用 itemId 定位
+      url = `https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(
+        itemId
+      )}/workbook`;
+    } else {
+      // 用文件名定位（文件必须在 OneDrive 根目录或你自己改路径）
+      url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(
+        fileName
+      )}:/workbook`;
+    }
+
+    const r = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    res.json({
+      ok: true,
+      excel: "reachable",
+      workbook: r.data.name || fileName,
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.message,
     });
   }
 });
