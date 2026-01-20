@@ -1,36 +1,49 @@
-// msalClient.js  (CommonJS)
+// msalClient.js
+const { PublicClientApplication } = require("@azure/msal-node");
+const fs = require("fs");
+const path = require("path");
 
-const msal = require("@azure/msal-node");
+const cachePath = path.join(__dirname, "msal-cache.json");
 
-const clientId = process.env.AZURE_CLIENT_ID;
-const tenantId = process.env.AZURE_TENANT_ID;
-const cacheB64 = process.env.MSAL_CACHE_BASE64;
-
-if (!clientId || !tenantId) {
-  throw new Error("Missing AZURE_CLIENT_ID or AZURE_TENANT_ID");
-}
-if (!cacheB64) {
-  throw new Error("Missing MSAL_CACHE_BASE64");
-}
-
-// 用 cachePlugin 把 Render env 里的 token cache 喂给 MSAL
-const cachePlugin = {
-  beforeCacheAccess: async (cacheContext) => {
-    const cacheJson = Buffer.from(cacheB64, "base64").toString("utf8");
-    cacheContext.tokenCache.deserialize(cacheJson);
+const msalConfig = {
+  auth: {
+    clientId: process.env.AZURE_CLIENT_ID,
+    authority: `https://login.microsoftonline.com/${process.env.AZURE_TENANT_ID}`,
   },
-  afterCacheAccess: async () => {
-    // Render env 不能回写，所以这里不做 serialize 回写
+  cache: {
+    cachePlugin: {
+      beforeCacheAccess: async (ctx) => {
+        if (fs.existsSync(cachePath)) {
+          ctx.tokenCache.deserialize(fs.readFileSync(cachePath, "utf-8"));
+        }
+      },
+      afterCacheAccess: async (ctx) => {
+        if (ctx.cacheHasChanged) {
+          fs.writeFileSync(cachePath, ctx.tokenCache.serialize());
+        }
+      },
+    },
   },
 };
 
-const pca = new msal.PublicClientApplication({
-  auth: {
-    clientId,
-    authority: `https://login.microsoftonline.com/${tenantId}`,
-  },
-  cache: { cachePlugin },
-});
+const pca = new PublicClientApplication(msalConfig);
 
-module.exports = { pca };
+async function getGraphToken() {
+  const accounts = await pca.getTokenCache().getAllAccounts();
 
+  if (accounts.length === 0) {
+    throw new Error("No cached account found. Run device login first.");
+  }
+
+  const result = await pca.acquireTokenSilent({
+    account: accounts[0],
+    scopes: ["User.Read", "Files.Read"],
+  });
+
+  return result.accessToken;
+}
+
+module.exports = {
+  pca,
+  getGraphToken,
+};
