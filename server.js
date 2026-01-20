@@ -85,6 +85,39 @@ app.get("/api/_health/excel", async (req, res) => {
     });
   }
 });
+app.get("/api/_health/excel", async (req, res) => {
+  try {
+    const token = await getGraphToken(["User.Read", "Files.Read"]);
+
+    const itemId = process.env.EXCEL_ITEM_ID;
+    if (!itemId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing EXCEL_ITEM_ID in Render environment variables",
+      });
+    }
+
+    // 只验证 workbook 是否可访问
+    const url = `https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(
+      itemId
+    )}/workbook`;
+
+    const r = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    res.json({
+      ok: true,
+      excel: "reachable",
+      workbook: r.data.name || "workbook",
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+    });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
