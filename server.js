@@ -85,6 +85,27 @@ app.get('/api/shipments', requireLogin, (req, res) => {
 app.get('/', (req, res) => {
   res.send('Cargo Tracking API is running OK.');
 });
+app.get("/api/_health/graph", async (req, res) => {
+  try {
+    const result = await pca.acquireTokenSilent({
+      scopes: ["User.Read"],
+      account: pca.getAllAccounts()[0],
+    });
+
+    res.json({
+      ok: true,
+      message: "Microsoft Graph reachable",
+      tenantId: result.tenantId,
+      expiresOn: result.expiresOn,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+      errorCode: err.errorCode,
+    });
+  }
+});
 
 // THIS IS REQUIRED FOR RENDER
 app.listen(PORT, '0.0.0.0', () => {
