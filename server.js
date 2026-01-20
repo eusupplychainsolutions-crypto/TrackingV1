@@ -89,18 +89,8 @@ app.get("/api/_health/excel", async (req, res) => {
   try {
     const token = await getGraphToken(["User.Read", "Files.Read"]);
 
-    const itemId = process.env.EXCEL_ITEM_ID;
-    if (!itemId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing EXCEL_ITEM_ID in Render environment variables",
-      });
-    }
-
-    // 只验证 workbook 是否可访问
-    const url = `https://graph.microsoft.com/v1.0/me/drive/items/${encodeURIComponent(
-      itemId
-    )}/workbook`;
+    const fileName = process.env.EXCEL_FILE_NAME || "JobTrackingSample.xlsx";
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(fileName)}:/workbook`;
 
     const r = await axios.get(url, {
       headers: { Authorization: `Bearer ${token}` },
@@ -109,15 +99,16 @@ app.get("/api/_health/excel", async (req, res) => {
     res.json({
       ok: true,
       excel: "reachable",
-      workbook: r.data.name || "workbook",
+      workbook: r.data.name || fileName,
     });
   } catch (e) {
     res.status(500).json({
       ok: false,
-      error: e.message,
+      error: e.response?.data || e.message,
     });
   }
 });
+
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
