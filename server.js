@@ -4,6 +4,7 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+import { pca } from "./auth/msalClient.js";
 
 // CORS
 app.use(cors({ origin: true, credentials: true }));
