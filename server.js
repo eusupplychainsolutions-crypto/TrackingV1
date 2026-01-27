@@ -1,8 +1,11 @@
-// server.js (CommonJS) - 覆盖版：个人 OneDrive 用 /content 下载 + 本地解析（不走 /workbook）
+// server.js (CommonJS) — FINAL for A Route (App-only)
+// - Uses /users/{upn}/drive (NOT /me)
+// - Downloads Excel via /content
+// - Optional parse with exceljs if installed
+
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-//const ExcelJS = require("exceljs");
 const { getGraphToken } = require("./msalClient");
 
 const app = express();
@@ -11,16 +14,48 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
+// ===== Config =====
+const HEALTH_KEY = process.env.HEALTH_KEY || ""; // optional
+const OD_USER_UPN = process.env.OD_USER_UPN || ""; // REQUIRED for app-only
+const EXCEL_FILE_NAME = process.env.EXCEL_FILE_NAME || "JobTrackingSample.xlsx";
+
+function requireHealthKey(req, res) {
+  if (!HEALTH_KEY) return true; // if not set, allow (for quick testing)
+  const key = req.query.key || req.headers["x-health-key"];
+  if (key !== HEALTH_KEY) {
+    res.status(401).json({ ok: false, message: "Unauthorized: invalid health key" });
+    return false;
+  }
+  return true;
+}
+
+function encodeGraphPath(path) {
+  return String(path)
+    .split("/")
+    .filter(Boolean)
+    .map((p) => encodeURIComponent(p))
+    .join("/");
+}
+
+// ===== Routes =====
 app.get("/", (req, res) => {
   res.send("Cargo Tracking API is running OK.");
 });
 
-// Graph 探针：验证 token + Microsoft Graph 是否可访问
+/**
+ * Graph probe (app-only):
+ * - Do NOT call /me (no user context in app-only)
+ * - Just validate token + Graph reachable.
+ * Requires Sites.Read.All (Application) to succeed.
+ */
 app.get("/api/_health/graph", async (req, res) => {
-  try {
-    const token = await getGraphToken(["User.Read"]);
+  if (!requireHealthKey(req, res)) return;
 
-    const r = await axios.get("https://graph.microsoft.com/v1.0/me", {
+  try {
+    const token = await getGraphToken();
+
+    // Lightweight app-only check (no /me)
+    const r = await axios.get("https://graph.microsoft.com/v1.0/sites?search=*", {
       headers: { Authorization: `Bearer ${token}` },
       timeout: 15000,
     });
@@ -28,7 +63,7 @@ app.get("/api/_health/graph", async (req, res) => {
     res.json({
       ok: true,
       graph: "reachable",
-      user: r.data.userPrincipalName || r.data.mail || r.data.id,
+      sitesSampleCount: Array.isArray(r.data?.value) ? r.data.value.length : 0,
     });
   } catch (e) {
     res.status(e.response?.status || 500).json({
@@ -42,79 +77,112 @@ app.get("/api/_health/graph", async (req, res) => {
 });
 
 /**
- * Excel 探针（个人 OneDrive 推荐）：
- * 1) Graph: 先确认文件存在（metadata）
- * 2) Graph: 用 /content 下载 xlsx（二进制）
- * 3) exceljs: 本地解析，返回 sheetName / 行列数等信息
+ * Excel probe (app-only):
+ * 1) metadata via /users/{upn}/drive/root:/path
+ * 2) download via /content
+ * 3) optional parse via exceljs (if installed)
  *
- * 环境变量：
- * - EXCEL_FILE_NAME: 默认 JobTrackingSample.xlsx
- *   如果在 Documents 下：Documents/JobTrackingSample.xlsx
+ * REQUIRED env:
+ * - OD_USER_UPN (e.g. zhaaojiang@eusupplychainsolutions.onmicrosoft.com)
+ *
+ * Permissions required (Azure App -> Application permissions):
+ * - Files.Read.All  (and usually Sites.Read.All as well)
+ * - Admin consent granted
  */
 app.get("/api/_health/excel", async (req, res) => {
+  if (!requireHealthKey(req, res)) return;
+
+  if (!OD_USER_UPN) {
+    return res.status(500).json({
+      ok: false,
+      message: "Missing env OD_USER_UPN (OneDrive owner UPN).",
+    });
+  }
+
   try {
-    const token = await getGraphToken(["Files.Read"]);
+    const token = await getGraphToken();
+    const encodedPath = encodeGraphPath(EXCEL_FILE_NAME);
 
-    const filePath = process.env.EXCEL_FILE_NAME || "JobTrackingSample.xlsx";
-    // 注意：Graph 路径里 folder/file 之间用 /，这里不要把整个 path encode 掉
-    const encodedPath = filePath
-      .split("/")
-      .map((p) => encodeURIComponent(p))
-      .join("/");
+    // 1) metadata
+    const metaUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      OD_USER_UPN
+    )}/drive/root:/${encodedPath}`;
 
-    // 1) 先拿 metadata，确认文件存在 & 拿到大小等信息
-    const metaUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodedPath}`;
     const metaResp = await axios.get(metaUrl, {
       headers: { Authorization: `Bearer ${token}` },
       timeout: 20000,
     });
 
-    // 2) 下载文件内容（xlsx 二进制）
-    const contentUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodedPath}:/content`;
+    // 2) download content
+    const contentUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      OD_USER_UPN
+    )}/drive/root:/${encodedPath}:/content`;
+
     const contentResp = await axios.get(contentUrl, {
       headers: { Authorization: `Bearer ${token}` },
       responseType: "arraybuffer",
       timeout: 30000,
-      maxContentLength: 50 * 1024 * 1024, // 50MB
+      maxContentLength: 50 * 1024 * 1024,
       maxBodyLength: 50 * 1024 * 1024,
     });
 
     const buffer = Buffer.from(contentResp.data);
 
-    // 3) 解析 xlsx
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(buffer);
+    // 3) optional parse (exceljs)
+    let parse = {
+      parsed: false,
+      engine: null,
+      sheetName: null,
+      rowCount: null,
+      colCount: null,
+      firstRow: null,
+      note: null,
+    };
 
-    const firstSheet = workbook.worksheets[0];
-    const sheetName = firstSheet ? firstSheet.name : null;
+    let ExcelJS = null;
+    try {
+      ExcelJS = require("exceljs");
+    } catch (_) {
+      // ignore if not installed
+    }
 
-    // 取一个轻量信息用于 health check
-    const rowCount = firstSheet ? firstSheet.rowCount : 0;
-    const colCount = firstSheet ? firstSheet.columnCount : 0;
+    if (ExcelJS) {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(buffer);
 
-    // 可选：读取第一行（注意 values[0] 是空占位）
-    let firstRow = null;
-    if (firstSheet && rowCount >= 1) {
-      const values = firstSheet.getRow(1).values;
-      // 去掉索引 0 占位，并把 undefined/null 清理一下
-      firstRow = Array.isArray(values) ? values.slice(1).map((v) => (v == null ? "" : v)) : null;
+      const firstSheet = workbook.worksheets[0];
+      if (firstSheet) {
+        parse.parsed = true;
+        parse.engine = "exceljs";
+        parse.sheetName = firstSheet.name;
+        parse.rowCount = firstSheet.rowCount;
+        parse.colCount = firstSheet.columnCount;
+
+        if (firstSheet.rowCount >= 1) {
+          const values = firstSheet.getRow(1).values;
+          parse.firstRow = Array.isArray(values)
+            ? values.slice(1).map((v) => (v == null ? "" : v))
+            : null;
+        }
+      } else {
+        parse.note = "Workbook has no worksheets.";
+      }
+    } else {
+      parse.note = "exceljs not installed; download-only check passed.";
     }
 
     res.json({
       ok: true,
-      excel: "download_and_parse_ok",
+      excel: "download_ok",
       file: {
-        path: filePath,
+        ownerUpn: OD_USER_UPN,
+        path: EXCEL_FILE_NAME,
         name: metaResp.data.name,
         size: metaResp.data.size,
         lastModifiedDateTime: metaResp.data.lastModifiedDateTime,
+        webUrl: metaResp.data.webUrl,
       },
-      workbook: {
-        sheetName,
-        rowCount,
-        colCount,
-        firstRow,
-      },
+      parse,
     });
   } catch (e) {
     res.status(e.response?.status || 500).json({
