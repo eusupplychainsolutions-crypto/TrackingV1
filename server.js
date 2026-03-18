@@ -1,7 +1,10 @@
-// server.js (CommonJS) — FINAL for A Route (App-only)
-// - Uses /users/{upn}/drive (NOT /me)
+// server.js (CommonJS)
+// ClearanceStatus version
+// - Uses /users/{upn}/drive (app-only)
 // - Downloads Excel via /content
-// - Optional parse with exceljs if installed
+// - Reads ClearanceStatus.xlsx
+// - Query by keyValue or customer
+// - Returns Customer / KeyValue / DSA1 Code / Updated ETA
 
 const express = require("express");
 const cors = require("cors");
@@ -15,12 +18,12 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
 // ===== Config =====
-const HEALTH_KEY = process.env.HEALTH_KEY || ""; // optional
-const OD_USER_UPN = process.env.OD_USER_UPN || ""; // REQUIRED for app-only
-const EXCEL_FILE_NAME = process.env.EXCEL_FILE_NAME || "JobTrackingSample.xlsx";
+const HEALTH_KEY = process.env.HEALTH_KEY || "";
+const OD_USER_UPN = process.env.OD_USER_UPN || "";
+const EXCEL_FILE_NAME = process.env.EXCEL_FILE_NAME || "ClearanceStatus.xlsx";
 
 function requireHealthKey(req, res) {
-  if (!HEALTH_KEY) return true; // if not set, allow (for quick testing)
+  if (!HEALTH_KEY) return true;
   const key = req.query.key || req.headers["x-health-key"];
   if (key !== HEALTH_KEY) {
     res.status(401).json({ ok: false, message: "Unauthorized: invalid health key" });
@@ -37,16 +40,32 @@ function encodeGraphPath(path) {
     .join("/");
 }
 
-// ===== Routes =====
+function ci(v) {
+  return String(v ?? "").trim().toLowerCase();
+}
+
+function hasText(v) {
+  return String(v ?? "").trim() !== "";
+}
+
+function normalizeCell(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
+
+function pick(row, keys) {
+  for (const k of keys) {
+    if (k in row) return row[k];
+  }
+  return "";
+}
+
 app.get("/", (req, res) => {
   res.send("Cargo Tracking API is running OK.");
 });
 
 /**
- * Graph probe (app-only):
- * - Do NOT call /me (no user context in app-only)
- * - Just validate token + Graph reachable.
- * Requires Sites.Read.All (Application) to succeed.
+ * Graph health
  */
 app.get("/api/_health/graph", async (req, res) => {
   if (!requireHealthKey(req, res)) return;
@@ -54,7 +73,6 @@ app.get("/api/_health/graph", async (req, res) => {
   try {
     const token = await getGraphToken();
 
-    // Lightweight app-only check (no /me)
     const r = await axios.get("https://graph.microsoft.com/v1.0/sites?search=*", {
       headers: { Authorization: `Bearer ${token}` },
       timeout: 15000,
@@ -77,17 +95,7 @@ app.get("/api/_health/graph", async (req, res) => {
 });
 
 /**
- * Excel probe (app-only):
- * 1) metadata via /users/{upn}/drive/root:/path
- * 2) download via /content
- * 3) optional parse via exceljs (if installed)
- *
- * REQUIRED env:
- * - OD_USER_UPN (e.g. zhaaojiang@eusupplychainsolutions.onmicrosoft.com)
- *
- * Permissions required (Azure App -> Application permissions):
- * - Files.Read.All  (and usually Sites.Read.All as well)
- * - Admin consent granted
+ * Excel health
  */
 app.get("/api/_health/excel", async (req, res) => {
   if (!requireHealthKey(req, res)) return;
@@ -103,7 +111,6 @@ app.get("/api/_health/excel", async (req, res) => {
     const token = await getGraphToken();
     const encodedPath = encodeGraphPath(EXCEL_FILE_NAME);
 
-    // 1) metadata
     const metaUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       OD_USER_UPN
     )}/drive/root:/${encodedPath}`;
@@ -113,7 +120,6 @@ app.get("/api/_health/excel", async (req, res) => {
       timeout: 20000,
     });
 
-    // 2) download content
     const contentUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       OD_USER_UPN
     )}/drive/root:/${encodedPath}:/content`;
@@ -128,7 +134,6 @@ app.get("/api/_health/excel", async (req, res) => {
 
     const buffer = Buffer.from(contentResp.data);
 
-    // 3) optional parse (exceljs)
     let parse = {
       parsed: false,
       engine: null,
@@ -142,9 +147,7 @@ app.get("/api/_health/excel", async (req, res) => {
     let ExcelJS = null;
     try {
       ExcelJS = require("exceljs");
-    } catch (_) {
-      // ignore if not installed
-    }
+    } catch (_) {}
 
     if (ExcelJS) {
       const workbook = new ExcelJS.Workbook();
@@ -194,15 +197,25 @@ app.get("/api/_health/excel", async (req, res) => {
     });
   }
 });
+
 /**
- * Business API: Shipments
- * GET /api/shipments?key=...&limit=200&jobNo=...&mbl=...&hbl=...&containerNo=...&consignee=...
+ * Business API: Clearance
+ * GET /api/clearance?key=...&q=...
+ * GET /api/clearance?key=...&keyValue=...
+ * GET /api/clearance?key=...&customer=...
  *
- * - Reads Excel (first row as headers)
- * - Returns array of objects
- * - Basic contains-filter on a few fields
+ * Supports:
+ * - q: searches keyValue OR customer
+ * - keyValue: searches KeyValue
+ * - customer: searches Customer
+ *
+ * Returns:
+ * - Customer
+ * - KeyValue
+ * - DSA1 Code
+ * - Updated ETA
  */
-app.get("/api/shipments", async (req, res) => {
+app.get("/api/clearance", async (req, res) => {
   if (!requireHealthKey(req, res)) return;
 
   try {
@@ -213,7 +226,7 @@ app.get("/api/shipments", async (req, res) => {
       return res.status(500).json({ ok: false, message: "Missing env OD_USER_UPN" });
     }
 
-    const filePath = process.env.EXCEL_FILE_NAME || "JobTrackingSample.xlsx";
+    const filePath = process.env.EXCEL_FILE_NAME || "ClearanceStatus.xlsx";
     const encodedPath = encodeGraphPath(filePath);
 
     const contentUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
@@ -223,37 +236,38 @@ app.get("/api/shipments", async (req, res) => {
     const contentResp = await axios.get(contentUrl, {
       headers: { Authorization: `Bearer ${token}` },
       responseType: "arraybuffer",
-      timeout: 30000
+      timeout: 30000,
+      maxContentLength: 50 * 1024 * 1024,
+      maxBodyLength: 50 * 1024 * 1024,
     });
 
     const ExcelJS = require("exceljs");
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(Buffer.from(contentResp.data));
 
-    // sheet: allow override, default first worksheet
-    const sheetName = req.query.sheet || workbook.worksheets[0]?.name;
+    const sheetName = req.query.sheet || workbook.worksheets[0]?.name || "Sheet1";
     const ws = workbook.getWorksheet(sheetName);
+
     if (!ws) {
-      return res.status(404).json({ ok: false, message: `Sheet not found: ${sheetName}` });
+      return res.status(404).json({
+        ok: false,
+        message: `Sheet not found: ${sheetName}`,
+      });
     }
 
-    // header row
     const headerRowIdx = parseInt(req.query.headerRow || "1", 10);
+
     const headerVals = ws
       .getRow(headerRowIdx)
       .values
       .slice(1)
       .map((v) => (v == null ? "" : String(v).trim()));
 
-    // build rows
-    const maxLimit = 1000;
-    const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, maxLimit);
-
     const rows = [];
-    for (let r = headerRowIdx + 1; r <= ws.rowCount && rows.length < limit; r++) {
+
+    for (let r = headerRowIdx + 1; r <= ws.rowCount; r++) {
       const vals = ws.getRow(r).values.slice(1);
 
-      // skip fully empty rows
       const hasAny = vals.some((v) => v !== null && v !== undefined && String(v).trim() !== "");
       if (!hasAny) continue;
 
@@ -263,49 +277,62 @@ app.get("/api/shipments", async (req, res) => {
         obj[key] = vals[c] ?? "";
       }
 
-      rows.push(obj);
+      // normalize target fields
+      const customer = normalizeCell(pick(obj, ["Customer"]));
+      const keyValue = normalizeCell(pick(obj, ["KeyValue"]));
+      const dsa1Code = normalizeCell(pick(obj, ["DSA1 Code"]));
+      const updatedETA = normalizeCell(pick(obj, ["Updated ETA"]));
+
+      // skip junk rows
+      if (!hasText(customer) && !hasText(keyValue) && !hasText(dsa1Code) && !hasText(updatedETA)) {
+        continue;
+      }
+
+      // skip repeated/bad header-like row
+      if (ci(customer) === "customer" && ci(keyValue) === "keyvalue") {
+        continue;
+      }
+
+      // skip weird partial rows that have no useful search values
+      if (!hasText(customer) && !hasText(keyValue)) {
+        continue;
+      }
+
+      rows.push({
+        Customer: customer,
+        KeyValue: keyValue,
+        "DSA1 Code": dsa1Code,
+        "Updated ETA": updatedETA,
+      });
     }
 
-    // helper: contains filter (case-insensitive)
-    const ci = (s) => String(s ?? "").toLowerCase();
-    const contains = (value, q) => ci(value).includes(ci(q));
-
-    // common filters (optional)
-    const qJobNo = req.query.jobNo;
-    const qMbl = req.query.mbl;
-    const qHbl = req.query.hbl;
-    const qContainerNo = req.query.containerNo;
-    const qConsignee = req.query.consignee;
+    const q = req.query.q;
+    const qKeyValue = req.query.keyValue;
+    const qCustomer = req.query.customer;
 
     let filtered = rows;
 
-    // NOTE: header keys come from Excel; below tries several common variants
-    const pick = (row, keys) => {
-      for (const k of keys) {
-        if (k in row) return row[k];
-      }
-      return "";
-    };
+    if (q) {
+      filtered = filtered.filter(
+        (row) =>
+          ci(row["KeyValue"]).includes(ci(q)) ||
+          ci(row["Customer"]).includes(ci(q))
+      );
+    }
 
-    if (qJobNo) {
+    if (qKeyValue) {
       filtered = filtered.filter((row) =>
-        contains(pick(row, ["Job No.", "Job No", "JobNo", "Job"]), qJobNo)
+        ci(row["KeyValue"]).includes(ci(qKeyValue))
       );
     }
-    if (qMbl) {
-      filtered = filtered.filter((row) => contains(pick(row, ["MBL", "Mbl"]), qMbl));
-    }
-    if (qHbl) {
-      filtered = filtered.filter((row) => contains(pick(row, ["HBL", "Hbl"]), qHbl));
-    }
-    if (qContainerNo) {
+
+    if (qCustomer) {
       filtered = filtered.filter((row) =>
-        contains(pick(row, ["Container No.", "Container No", "ContainerNo", "Container"]), qContainerNo)
+        ci(row["Customer"]).includes(ci(qCustomer))
       );
     }
-    if (qConsignee) {
-      filtered = filtered.filter((row) => contains(pick(row, ["Consignee"]), qConsignee));
-    }
+
+    const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 1000);
 
     res.json({
       ok: true,
@@ -313,7 +340,7 @@ app.get("/api/shipments", async (req, res) => {
       headerRow: headerRowIdx,
       count: filtered.length,
       limit,
-      data: filtered
+      data: filtered.slice(0, limit),
     });
   } catch (e) {
     res.status(e.response?.status || 500).json({
@@ -321,7 +348,7 @@ app.get("/api/shipments", async (req, res) => {
       status: e.response?.status,
       graphError: e.response?.data,
       message: e.message,
-      requestUrl: e.config?.url
+      requestUrl: e.config?.url,
     });
   }
 });
