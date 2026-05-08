@@ -60,6 +60,68 @@ function pick(row, keys) {
   return "";
 }
 
+function formatDateDMY(dd, mm, yyyy) {
+  const day = String(dd).padStart(2, "0");
+  const month = String(mm).padStart(2, "0");
+  return `${day}/${month}/${yyyy}`;
+}
+
+function normalizeExcelValue(value, cell) {
+  if (value === null || value === undefined) return "";
+
+  // Important: prefer Excel's displayed text when available.
+  // This preserves dates like 5/12/2026 as shown in the worksheet.
+  const text = cell && typeof cell.text === "string" ? cell.text.trim() : "";
+  if (text) return text;
+
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return formatDateDMY(
+      value.getUTCDate(),
+      value.getUTCMonth() + 1,
+      value.getUTCFullYear()
+    );
+  }
+
+  return String(value).trim();
+}
+
+function normalizeUpdatedETA(value) {
+  const s = normalizeCell(value);
+  if (!s) return "";
+
+  // DD/MM/YYYY or D/M/YYYY
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    return formatDateDMY(m[1], m[2], m[3]);
+  }
+
+  // DD/MM/YY or D/M/YY
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (m) {
+    const yy = Number(m[3]);
+    const yyyy = yy >= 70 ? 1900 + yy : 2000 + yy;
+    return formatDateDMY(m[1], m[2], yyyy);
+  }
+
+  // YYYY-MM-DD or ISO string
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
+  if (m) {
+    return formatDateDMY(m[3], m[2], m[1]);
+  }
+
+  // English date string fallback
+  const parsed = new Date(s);
+  if (!isNaN(parsed.getTime())) {
+    return formatDateDMY(
+      parsed.getUTCDate(),
+      parsed.getUTCMonth() + 1,
+      parsed.getUTCFullYear()
+    );
+  }
+
+  return s;
+}
+
 app.get("/", (req, res) => {
   res.send("Cargo Tracking API is running OK.");
 });
@@ -200,20 +262,6 @@ app.get("/api/_health/excel", async (req, res) => {
 
 /**
  * Business API: Clearance
- * GET /api/clearance?key=...&q=...
- * GET /api/clearance?key=...&keyValue=...
- * GET /api/clearance?key=...&customer=...
- *
- * Supports:
- * - q: searches keyValue OR customer
- * - keyValue: searches KeyValue
- * - customer: searches Customer
- *
- * Returns:
- * - Customer
- * - KeyValue
- * - DSA1 Code
- * - Updated ETA
  */
 app.get("/api/clearance", async (req, res) => {
   if (!requireHealthKey(req, res)) return;
@@ -266,34 +314,32 @@ app.get("/api/clearance", async (req, res) => {
     const rows = [];
 
     for (let r = headerRowIdx + 1; r <= ws.rowCount; r++) {
-      const vals = ws.getRow(r).values.slice(1);
+      const row = ws.getRow(r);
 
-      const hasAny = vals.some((v) => v !== null && v !== undefined && String(v).trim() !== "");
+      const rawVals = row.values.slice(1);
+      const hasAny = rawVals.some((v) => v !== null && v !== undefined && String(v).trim() !== "");
       if (!hasAny) continue;
 
       const obj = {};
       for (let c = 0; c < headerVals.length; c++) {
         const key = headerVals[c] || `col_${c + 1}`;
-        obj[key] = vals[c] ?? "";
+        const cell = row.getCell(c + 1);
+        obj[key] = normalizeExcelValue(cell.value, cell);
       }
 
-      // normalize target fields
       const customer = normalizeCell(pick(obj, ["Customer"]));
       const keyValue = normalizeCell(pick(obj, ["KeyValue"]));
       const dsa1Code = normalizeCell(pick(obj, ["DSA1 Code"]));
-      const updatedETA = normalizeCell(pick(obj, ["Updated ETA"]));
+      const updatedETA = normalizeUpdatedETA(pick(obj, ["Updated ETA"]));
 
-      // skip junk rows
       if (!hasText(customer) && !hasText(keyValue) && !hasText(dsa1Code) && !hasText(updatedETA)) {
         continue;
       }
 
-      // skip repeated/bad header-like row
       if (ci(customer) === "customer" && ci(keyValue) === "keyvalue") {
         continue;
       }
 
-      // skip weird partial rows that have no useful search values
       if (!hasText(customer) && !hasText(keyValue)) {
         continue;
       }
