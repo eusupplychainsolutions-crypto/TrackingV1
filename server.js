@@ -86,20 +86,13 @@ function normalizeExcelValue(value, cell) {
 }
 
 function normalizeUpdatedETA(value) {
-  const s = String(value ?? "").trim();
-  if (!s) return "";
+  if (value === null || value === undefined) return "";
 
-  // ExcelJS Date object
-  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
-    return formatDateDMY(
-      value.getUTCDate(),
-      value.getUTCMonth() + 1,
-      value.getUTCFullYear()
-    );
-  }
+  const cleaned = String(value)
+    .replace(/\u00A0/g, " ")
+    .trim();
 
-  // Clean spaces, including hidden non-breaking spaces
-  const cleaned = s.replace(/\u00A0/g, " ").trim();
+  if (!cleaned) return "";
 
   // DD/MM/YYYY or D/M/YYYY
   let m = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
@@ -124,6 +117,19 @@ function normalizeUpdatedETA(value) {
   m = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
   if (m) {
     return formatDateDMY(Number(m[3]), Number(m[2]), Number(m[1]));
+  }
+
+  // Date object string fallback, e.g. Thu Nov 05 2026...
+  // 只处理明确英文日期，不再处理 slash date
+  if (/^[A-Za-z]{3}\s[A-Za-z]{3}\s\d{1,2}\s\d{4}/.test(cleaned)) {
+    const parsed = new Date(cleaned);
+    if (!isNaN(parsed.getTime())) {
+      return formatDateDMY(
+        parsed.getUTCDate(),
+        parsed.getUTCMonth() + 1,
+        parsed.getUTCFullYear()
+      );
+    }
   }
 
   return cleaned;
@@ -337,7 +343,14 @@ app.get("/api/clearance", async (req, res) => {
       const customer = normalizeCell(pick(obj, ["Customer"]));
       const keyValue = normalizeCell(pick(obj, ["KeyValue"]));
       const dsa1Code = normalizeCell(pick(obj, ["DSA1 Code"]));
-      const updatedETA = normalizeUpdatedETA(pick(obj, ["Updated ETA"]));
+      const updatedEtaColIndex = headerVals.findIndex(h => h === "Updated ETA") + 1;
+const updatedEtaCell = updatedEtaColIndex > 0 ? row.getCell(updatedEtaColIndex) : null;
+
+const updatedETA = normalizeUpdatedETA(
+  updatedEtaCell
+    ? (updatedEtaCell.text || updatedEtaCell.value || "")
+    : pick(obj, ["Updated ETA"])
+);
 
       if (!hasText(customer) && !hasText(keyValue) && !hasText(dsa1Code) && !hasText(updatedETA)) {
         continue;
