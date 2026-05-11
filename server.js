@@ -86,40 +86,47 @@ function normalizeExcelValue(value, cell) {
 }
 
 function normalizeUpdatedETA(value) {
-  const s = normalizeCell(value);
+  const s = String(value ?? "").trim();
   if (!s) return "";
 
-  // DD/MM/YYYY or D/M/YYYY
-  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (m) {
-    return formatDateDMY(m[1], m[2], m[3]);
-  }
-
-  // DD/MM/YY or D/M/YY
-  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
-  if (m) {
-    const yy = Number(m[3]);
-    const yyyy = yy >= 70 ? 1900 + yy : 2000 + yy;
-    return formatDateDMY(m[1], m[2], yyyy);
-  }
-
-  // YYYY-MM-DD or ISO string
-  m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
-  if (m) {
-    return formatDateDMY(m[3], m[2], m[1]);
-  }
-
-  // English date string fallback
-  const parsed = new Date(s);
-  if (!isNaN(parsed.getTime())) {
+  // ExcelJS Date object
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
     return formatDateDMY(
-      parsed.getUTCDate(),
-      parsed.getUTCMonth() + 1,
-      parsed.getUTCFullYear()
+      value.getUTCDate(),
+      value.getUTCMonth() + 1,
+      value.getUTCFullYear()
     );
   }
 
-  return s;
+  // Clean spaces, including hidden non-breaking spaces
+  const cleaned = s.replace(/\u00A0/g, " ").trim();
+
+  // DD/MM/YYYY or D/M/YYYY
+  let m = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = Number(m[2]);
+    const yyyy = Number(m[3]);
+    return formatDateDMY(dd, mm, yyyy);
+  }
+
+  // DD/MM/YY or D/M/YY
+  m = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = Number(m[2]);
+    const yy = Number(m[3]);
+    const yyyy = yy >= 70 ? 1900 + yy : 2000 + yy;
+    return formatDateDMY(dd, mm, yyyy);
+  }
+
+  // YYYY-MM-DD or ISO
+  m = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
+  if (m) {
+    return formatDateDMY(Number(m[3]), Number(m[2]), Number(m[1]));
+  }
+
+  return cleaned;
 }
 
 app.get("/", (req, res) => {
