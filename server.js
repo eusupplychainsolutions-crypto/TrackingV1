@@ -1,10 +1,6 @@
 // server.js (CommonJS)
 // ClearanceStatus version
-// - Uses /users/{upn}/drive (app-only)
-// - Downloads Excel via /content
-// - Reads ClearanceStatus.xlsx
-// - Query by keyValue or customer
-// - Returns Customer / KeyValue / DSA1 Code / Updated ETA
+// Stable DD/MM/YYYY handling for Excel ETA values
 
 const express = require("express");
 const cors = require("cors");
@@ -24,11 +20,17 @@ const EXCEL_FILE_NAME = process.env.EXCEL_FILE_NAME || "ClearanceStatus.xlsx";
 
 function requireHealthKey(req, res) {
   if (!HEALTH_KEY) return true;
+
   const key = req.query.key || req.headers["x-health-key"];
+
   if (key !== HEALTH_KEY) {
-    res.status(401).json({ ok: false, message: "Unauthorized: invalid health key" });
+    res.status(401).json({
+      ok: false,
+      message: "Unauthorized: invalid health key"
+    });
     return false;
   }
+
   return true;
 }
 
@@ -69,12 +71,17 @@ function formatDateDMY(dd, mm, yyyy) {
 function normalizeExcelValue(value, cell) {
   if (value === null || value === undefined) return "";
 
-  // Important: prefer Excel's displayed text when available.
-  // This preserves dates like 5/12/2026 as shown in the worksheet.
-  const text = cell && typeof cell.text === "string" ? cell.text.trim() : "";
+  const text =
+    cell && typeof cell.text === "string"
+      ? cell.text.replace(/\u00A0/g, " ").trim()
+      : "";
+
   if (text) return text;
 
-  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+  if (
+    Object.prototype.toString.call(value) === "[object Date]" &&
+    !isNaN(value.getTime())
+  ) {
     return formatDateDMY(
       value.getUTCDate(),
       value.getUTCMonth() + 1,
@@ -85,44 +92,73 @@ function normalizeExcelValue(value, cell) {
   return String(value).trim();
 }
 
-function normalizeUpdatedETA(value) {
-  if (value === null || value === undefined) return "";
+// ===== SPECIAL ETA HANDLER =====
+function normalizeUpdatedETACell(cell) {
+  if (!cell) return "";
 
-  const cleaned = String(value)
+  const rawText = String(cell.text || "")
+    .replace(/\u00A0/g, " ")
+    .trim();
+
+  // Always treat slash dates as DD/MM/YYYY
+  let m = rawText.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = Number(m[2]);
+    const yyyy = Number(m[3]);
+
+    return formatDateDMY(dd, mm, yyyy);
+  }
+
+  // DD/MM/YY
+  m = rawText.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = Number(m[2]);
+    const yy = Number(m[3]);
+
+    const yyyy = yy >= 70 ? 1900 + yy : 2000 + yy;
+
+    return formatDateDMY(dd, mm, yyyy);
+  }
+
+  const value = cell.value;
+
+  // Real Excel Date object
+  if (
+    Object.prototype.toString.call(value) === "[object Date]" &&
+    !isNaN(value.getTime())
+  ) {
+    return formatDateDMY(
+      value.getUTCDate(),
+      value.getUTCMonth() + 1,
+      value.getUTCFullYear()
+    );
+  }
+
+  const cleaned = String(value ?? rawText ?? "")
     .replace(/\u00A0/g, " ")
     .trim();
 
   if (!cleaned) return "";
 
-  // DD/MM/YYYY or D/M/YYYY
-  let m = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (m) {
-    const dd = Number(m[1]);
-    const mm = Number(m[2]);
-    const yyyy = Number(m[3]);
-    return formatDateDMY(dd, mm, yyyy);
-  }
-
-  // DD/MM/YY or D/M/YY
-  m = cleaned.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
-  if (m) {
-    const dd = Number(m[1]);
-    const mm = Number(m[2]);
-    const yy = Number(m[3]);
-    const yyyy = yy >= 70 ? 1900 + yy : 2000 + yy;
-    return formatDateDMY(dd, mm, yyyy);
-  }
-
-  // YYYY-MM-DD or ISO
+  // ISO
   m = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
+
   if (m) {
-    return formatDateDMY(Number(m[3]), Number(m[2]), Number(m[1]));
+    return formatDateDMY(
+      Number(m[3]),
+      Number(m[2]),
+      Number(m[1])
+    );
   }
 
-  // Date object string fallback, e.g. Thu Nov 05 2026...
-  // 只处理明确英文日期，不再处理 slash date
+  // English Date string
   if (/^[A-Za-z]{3}\s[A-Za-z]{3}\s\d{1,2}\s\d{4}/.test(cleaned)) {
     const parsed = new Date(cleaned);
+
     if (!isNaN(parsed.getTime())) {
       return formatDateDMY(
         parsed.getUTCDate(),
@@ -140,140 +176,6 @@ app.get("/", (req, res) => {
 });
 
 /**
- * Graph health
- */
-app.get("/api/_health/graph", async (req, res) => {
-  if (!requireHealthKey(req, res)) return;
-
-  try {
-    const token = await getGraphToken();
-
-    const r = await axios.get("https://graph.microsoft.com/v1.0/sites?search=*", {
-      headers: { Authorization: `Bearer ${token}` },
-      timeout: 15000,
-    });
-
-    res.json({
-      ok: true,
-      graph: "reachable",
-      sitesSampleCount: Array.isArray(r.data?.value) ? r.data.value.length : 0,
-    });
-  } catch (e) {
-    res.status(e.response?.status || 500).json({
-      ok: false,
-      status: e.response?.status,
-      graphError: e.response?.data,
-      message: e.message,
-      requestUrl: e.config?.url,
-    });
-  }
-});
-
-/**
- * Excel health
- */
-app.get("/api/_health/excel", async (req, res) => {
-  if (!requireHealthKey(req, res)) return;
-
-  if (!OD_USER_UPN) {
-    return res.status(500).json({
-      ok: false,
-      message: "Missing env OD_USER_UPN (OneDrive owner UPN).",
-    });
-  }
-
-  try {
-    const token = await getGraphToken();
-    const encodedPath = encodeGraphPath(EXCEL_FILE_NAME);
-
-    const metaUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
-      OD_USER_UPN
-    )}/drive/root:/${encodedPath}`;
-
-    const metaResp = await axios.get(metaUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-      timeout: 20000,
-    });
-
-    const contentUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
-      OD_USER_UPN
-    )}/drive/root:/${encodedPath}:/content`;
-
-    const contentResp = await axios.get(contentUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-      responseType: "arraybuffer",
-      timeout: 30000,
-      maxContentLength: 50 * 1024 * 1024,
-      maxBodyLength: 50 * 1024 * 1024,
-    });
-
-    const buffer = Buffer.from(contentResp.data);
-
-    let parse = {
-      parsed: false,
-      engine: null,
-      sheetName: null,
-      rowCount: null,
-      colCount: null,
-      firstRow: null,
-      note: null,
-    };
-
-    let ExcelJS = null;
-    try {
-      ExcelJS = require("exceljs");
-    } catch (_) {}
-
-    if (ExcelJS) {
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.load(buffer);
-
-      const firstSheet = workbook.worksheets[0];
-      if (firstSheet) {
-        parse.parsed = true;
-        parse.engine = "exceljs";
-        parse.sheetName = firstSheet.name;
-        parse.rowCount = firstSheet.rowCount;
-        parse.colCount = firstSheet.columnCount;
-
-        if (firstSheet.rowCount >= 1) {
-          const values = firstSheet.getRow(1).values;
-          parse.firstRow = Array.isArray(values)
-            ? values.slice(1).map((v) => (v == null ? "" : v))
-            : null;
-        }
-      } else {
-        parse.note = "Workbook has no worksheets.";
-      }
-    } else {
-      parse.note = "exceljs not installed; download-only check passed.";
-    }
-
-    res.json({
-      ok: true,
-      excel: "download_ok",
-      file: {
-        ownerUpn: OD_USER_UPN,
-        path: EXCEL_FILE_NAME,
-        name: metaResp.data.name,
-        size: metaResp.data.size,
-        lastModifiedDateTime: metaResp.data.lastModifiedDateTime,
-        webUrl: metaResp.data.webUrl,
-      },
-      parse,
-    });
-  } catch (e) {
-    res.status(e.response?.status || 500).json({
-      ok: false,
-      status: e.response?.status,
-      graphError: e.response?.data,
-      message: e.message,
-      requestUrl: e.config?.url,
-    });
-  }
-});
-
-/**
  * Business API: Clearance
  */
 app.get("/api/clearance", async (req, res) => {
@@ -283,46 +185,66 @@ app.get("/api/clearance", async (req, res) => {
     const token = await getGraphToken();
 
     const ownerUpn = process.env.OD_USER_UPN;
+
     if (!ownerUpn) {
-      return res.status(500).json({ ok: false, message: "Missing env OD_USER_UPN" });
+      return res.status(500).json({
+        ok: false,
+        message: "Missing env OD_USER_UPN"
+      });
     }
 
-    const filePath = process.env.EXCEL_FILE_NAME || "ClearanceStatus.xlsx";
+    const filePath =
+      process.env.EXCEL_FILE_NAME || "ClearanceStatus.xlsx";
+
     const encodedPath = encodeGraphPath(filePath);
 
-    const contentUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
-      ownerUpn
-    )}/drive/root:/${encodedPath}:/content`;
+    const contentUrl =
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+        ownerUpn
+      )}/drive/root:/${encodedPath}:/content`;
 
     const contentResp = await axios.get(contentUrl, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${token}`
+      },
       responseType: "arraybuffer",
       timeout: 30000,
       maxContentLength: 50 * 1024 * 1024,
-      maxBodyLength: 50 * 1024 * 1024,
+      maxBodyLength: 50 * 1024 * 1024
     });
 
     const ExcelJS = require("exceljs");
+
     const workbook = new ExcelJS.Workbook();
+
     await workbook.xlsx.load(Buffer.from(contentResp.data));
 
-    const sheetName = req.query.sheet || workbook.worksheets[0]?.name || "Sheet1";
+    const sheetName =
+      req.query.sheet ||
+      workbook.worksheets[0]?.name ||
+      "Sheet1";
+
     const ws = workbook.getWorksheet(sheetName);
 
     if (!ws) {
       return res.status(404).json({
         ok: false,
-        message: `Sheet not found: ${sheetName}`,
+        message: `Sheet not found: ${sheetName}`
       });
     }
 
-    const headerRowIdx = parseInt(req.query.headerRow || "1", 10);
+    const headerRowIdx = parseInt(
+      req.query.headerRow || "1",
+      10
+    );
 
     const headerVals = ws
       .getRow(headerRowIdx)
       .values
       .slice(1)
-      .map((v) => (v == null ? "" : String(v).trim()));
+      .map((v) =>
+        v == null ? "" : String(v).trim()
+      );
 
     const rows = [];
 
@@ -330,37 +252,75 @@ app.get("/api/clearance", async (req, res) => {
       const row = ws.getRow(r);
 
       const rawVals = row.values.slice(1);
-      const hasAny = rawVals.some((v) => v !== null && v !== undefined && String(v).trim() !== "");
+
+      const hasAny = rawVals.some(
+        (v) =>
+          v !== null &&
+          v !== undefined &&
+          String(v).trim() !== ""
+      );
+
       if (!hasAny) continue;
 
       const obj = {};
+
       for (let c = 0; c < headerVals.length; c++) {
         const key = headerVals[c] || `col_${c + 1}`;
+
         const cell = row.getCell(c + 1);
-        obj[key] = normalizeExcelValue(cell.value, cell);
+
+        obj[key] = normalizeExcelValue(
+          cell.value,
+          cell
+        );
       }
 
-      const customer = normalizeCell(pick(obj, ["Customer"]));
-      const keyValue = normalizeCell(pick(obj, ["KeyValue"]));
-      const dsa1Code = normalizeCell(pick(obj, ["DSA1 Code"]));
-      const updatedEtaColIndex = headerVals.findIndex(h => h === "Updated ETA") + 1;
-const updatedEtaCell = updatedEtaColIndex > 0 ? row.getCell(updatedEtaColIndex) : null;
+      const customer = normalizeCell(
+        pick(obj, ["Customer"])
+      );
 
-const updatedETA = normalizeUpdatedETA(
-  updatedEtaCell
-    ? (updatedEtaCell.text || updatedEtaCell.value || "")
-    : pick(obj, ["Updated ETA"])
-);
+      const keyValue = normalizeCell(
+        pick(obj, ["KeyValue"])
+      );
 
-      if (!hasText(customer) && !hasText(keyValue) && !hasText(dsa1Code) && !hasText(updatedETA)) {
+      const dsa1Code = normalizeCell(
+        pick(obj, ["DSA1 Code"])
+      );
+
+      // ===== SPECIAL ETA =====
+      const updatedEtaColIndex =
+        headerVals.findIndex(
+          (h) => h === "Updated ETA"
+        ) + 1;
+
+      const updatedEtaCell =
+        updatedEtaColIndex > 0
+          ? row.getCell(updatedEtaColIndex)
+          : null;
+
+      const updatedETA =
+        normalizeUpdatedETACell(updatedEtaCell);
+
+      if (
+        !hasText(customer) &&
+        !hasText(keyValue) &&
+        !hasText(dsa1Code) &&
+        !hasText(updatedETA)
+      ) {
         continue;
       }
 
-      if (ci(customer) === "customer" && ci(keyValue) === "keyvalue") {
+      if (
+        ci(customer) === "customer" &&
+        ci(keyValue) === "keyvalue"
+      ) {
         continue;
       }
 
-      if (!hasText(customer) && !hasText(keyValue)) {
+      if (
+        !hasText(customer) &&
+        !hasText(keyValue)
+      ) {
         continue;
       }
 
@@ -368,7 +328,7 @@ const updatedETA = normalizeUpdatedETA(
         Customer: customer,
         KeyValue: keyValue,
         "DSA1 Code": dsa1Code,
-        "Updated ETA": updatedETA,
+        "Updated ETA": updatedETA
       });
     }
 
@@ -398,7 +358,10 @@ const updatedETA = normalizeUpdatedETA(
       );
     }
 
-    const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 1000);
+    const limit = Math.min(
+      parseInt(req.query.limit || "200", 10) || 200,
+      1000
+    );
 
     res.json({
       ok: true,
@@ -406,7 +369,7 @@ const updatedETA = normalizeUpdatedETA(
       headerRow: headerRowIdx,
       count: filtered.length,
       limit,
-      data: filtered.slice(0, limit),
+      data: filtered.slice(0, limit)
     });
   } catch (e) {
     res.status(e.response?.status || 500).json({
@@ -414,7 +377,7 @@ const updatedETA = normalizeUpdatedETA(
       status: e.response?.status,
       graphError: e.response?.data,
       message: e.message,
-      requestUrl: e.config?.url,
+      requestUrl: e.config?.url
     });
   }
 });
